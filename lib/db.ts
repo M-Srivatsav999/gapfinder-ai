@@ -1,15 +1,15 @@
 import { PrismaClient } from "@prisma/client";
 import fs from "fs";
 import path from "path";
-import os from "os";
+import { execSync } from "child_process";
 import { DEMO_DATA } from "./seed-data";
 import { calculateDeterministicRevisionSchedule } from "./revision-formula";
 
 const globalForPrisma = globalThis as unknown as {
   prisma: PrismaClient | undefined;
-  dbInitialized: boolean | undefined;
 };
 
+// Check if running on Vercel serverless environment
 const isVercel =
   process.env.VERCEL === "1" ||
   Boolean(process.env.VERCEL) ||
@@ -17,24 +17,24 @@ const isVercel =
 
 /**
  * Resolves the appropriate writable SQLite file path and connection URL.
- * On Vercel / serverless: uses /tmp/dev.db (the only writable directory).
- * On local: uses prisma/dev.db.
+ * On Vercel: strictly file:/tmp/dev.db (the only writable directory).
+ * On Local: prisma/dev.db.
  */
 function getDatabaseConfig(): { dbPath: string; dbUrl: string } {
   if (isVercel) {
-    const tmpDir = process.platform === "win32" ? os.tmpdir() : "/tmp";
-    const dbPath = path.join(tmpDir, "dev.db");
+    const dbPath = "/tmp/dev.db";
     return {
       dbPath,
-      dbUrl: `file:${dbPath.replace(/\\/g, "/")}`,
+      dbUrl: "file:/tmp/dev.db",
     };
   }
 
   // Local development
   const localPath = path.join(process.cwd(), "prisma", "dev.db");
+  const localUrl = process.env.DATABASE_URL || `file:${localPath.replace(/\\/g, "/")}`;
   return {
     dbPath: localPath,
-    dbUrl: process.env.DATABASE_URL || `file:${localPath.replace(/\\/g, "/")}`,
+    dbUrl: localUrl,
   };
 }
 
@@ -45,52 +45,24 @@ process.env.DATABASE_URL = dbUrl;
 
 /**
  * Initializes the SQLite database file on disk.
- * If running on Vercel and /tmp/dev.db does not exist, copies from project source
- * or prepares for DDL table creation.
+ * If running on Vercel: creates /tmp/dev.db immediately if missing or 0 bytes.
+ * Does NOT attempt to copy missing files.
  */
 function prepareDatabaseFile(): void {
   try {
     if (isVercel) {
-      if (!fs.existsSync(dbPath)) {
-        console.log(`[Vercel Serverless] Initializing writable SQLite database at ${dbPath}...`);
-
-        // Check potential locations for bundled template database
-        const candidateSources = [
-          path.join(process.cwd(), "prisma", "dev.db"),
-          path.join(process.cwd(), "dev.db"),
-          path.join(__dirname, "..", "prisma", "dev.db"),
-          path.join(__dirname, "..", "..", "prisma", "dev.db"),
-        ];
-
-        let copied = false;
-        for (const source of candidateSources) {
-          if (fs.existsSync(source) && fs.statSync(source).size > 0) {
-            try {
-              fs.mkdirSync(path.dirname(dbPath), { recursive: true });
-              fs.copyFileSync(source, dbPath);
-              console.log(`[Vercel Serverless] Successfully copied database from ${source} to ${dbPath}`);
-              copied = true;
-              break;
-            } catch (copyErr) {
-              console.warn(`[Vercel Serverless] Copy attempt failed from ${source}:`, copyErr);
-            }
-          }
-        }
-
-        if (!copied) {
-          console.log(`[Vercel Serverless] No pre-existing database found. Creating empty file at ${dbPath}...`);
-          fs.mkdirSync(path.dirname(dbPath), { recursive: true });
-          fs.writeFileSync(dbPath, "");
-        }
+      if (!fs.existsSync(dbPath) || fs.statSync(dbPath).size === 0) {
+        console.log(`[Vercel Serverless] Creating fresh writable SQLite database at ${dbPath}...`);
+        fs.mkdirSync(path.dirname(dbPath), { recursive: true });
+        fs.writeFileSync(dbPath, "");
       }
     } else {
-      // Local development check
       if (!fs.existsSync(dbPath)) {
         fs.mkdirSync(path.dirname(dbPath), { recursive: true });
       }
     }
   } catch (err) {
-    console.error("Error preparing database file on disk:", err);
+    console.error("Error creating database file on disk:", err);
   }
 }
 
@@ -110,124 +82,323 @@ export const prisma =
 if (process.env.NODE_ENV !== "production") globalForPrisma.prisma = prisma;
 
 /**
- * Executes DDL statements to ensure all SQLite tables exist if running on a fresh /tmp/dev.db
+ * Programmatic DDL statements to create all tables inside /tmp/dev.db
+ */
+const DDL_STATEMENTS = [
+  `PRAGMA journal_mode = WAL;`,
+  `PRAGMA foreign_keys = ON;`,
+  `CREATE TABLE IF NOT EXISTS "User" (
+    "id" TEXT NOT NULL PRIMARY KEY,
+    "email" TEXT NOT NULL,
+    "name" TEXT NOT NULL,
+    "password" TEXT NOT NULL DEFAULT 'demo1234',
+    "role" TEXT NOT NULL DEFAULT 'student',
+    "createdAt" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    "updatedAt" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+  );`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS "User_email_key" ON "User"("email");`,
+  `CREATE TABLE IF NOT EXISTS "Course" (
+    "id" TEXT NOT NULL PRIMARY KEY,
+    "code" TEXT NOT NULL,
+    "title" TEXT NOT NULL,
+    "description" TEXT NOT NULL,
+    "scope" TEXT NOT NULL DEFAULT 'full',
+    "createdAt" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    "updatedAt" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+  );`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS "Course_code_key" ON "Course"("code");`,
+  `CREATE TABLE IF NOT EXISTS "Topic" (
+    "id" TEXT NOT NULL PRIMARY KEY,
+    "courseId" TEXT NOT NULL,
+    "unitName" TEXT NOT NULL,
+    "topicName" TEXT NOT NULL,
+    "subtopicName" TEXT NOT NULL,
+    "syllabusRequired" BOOLEAN NOT NULL DEFAULT true,
+    "inNotes" BOOLEAN NOT NULL DEFAULT true,
+    "examFrequency" INTEGER NOT NULL DEFAULT 1,
+    "examMarksAvg" REAL NOT NULL DEFAULT 10.0,
+    "prerequisiteIds" TEXT NOT NULL DEFAULT '[]',
+    "alpha" REAL NOT NULL DEFAULT 1.0,
+    "beta" REAL NOT NULL DEFAULT 1.0,
+    "estimatedMastery" REAL NOT NULL DEFAULT 0.5,
+    "revisionPriority" REAL NOT NULL DEFAULT 0.5,
+    "createdAt" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    "updatedAt" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT "Topic_courseId_fkey" FOREIGN KEY ("courseId") REFERENCES "Course" ("id") ON DELETE CASCADE ON UPDATE CASCADE
+  );`,
+  `CREATE TABLE IF NOT EXISTS "Document" (
+    "id" TEXT NOT NULL PRIMARY KEY,
+    "courseId" TEXT NOT NULL,
+    "title" TEXT NOT NULL,
+    "type" TEXT NOT NULL,
+    "fileName" TEXT NOT NULL,
+    "fileSize" INTEGER NOT NULL DEFAULT 0,
+    "uploadedAt" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT "Document_courseId_fkey" FOREIGN KEY ("courseId") REFERENCES "Course" ("id") ON DELETE CASCADE ON UPDATE CASCADE
+  );`,
+  `CREATE TABLE IF NOT EXISTS "DocumentChunk" (
+    "id" TEXT NOT NULL PRIMARY KEY,
+    "documentId" TEXT NOT NULL,
+    "topicId" TEXT,
+    "section" TEXT NOT NULL,
+    "content" TEXT NOT NULL,
+    "embedding" TEXT,
+    "tokenCount" INTEGER NOT NULL DEFAULT 0,
+    "createdAt" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT "DocumentChunk_documentId_fkey" FOREIGN KEY ("documentId") REFERENCES "Document" ("id") ON DELETE CASCADE ON UPDATE CASCADE,
+    CONSTRAINT "DocumentChunk_topicId_fkey" FOREIGN KEY ("topicId") REFERENCES "Topic" ("id") ON DELETE SET NULL ON UPDATE CASCADE
+  );`,
+  `CREATE TABLE IF NOT EXISTS "QuizQuestion" (
+    "id" TEXT NOT NULL PRIMARY KEY,
+    "topicId" TEXT NOT NULL,
+    "chunkId" TEXT,
+    "question" TEXT NOT NULL,
+    "options" TEXT NOT NULL,
+    "correctAnswerIndex" INTEGER NOT NULL,
+    "explanation" TEXT NOT NULL,
+    "quoteCitation" TEXT NOT NULL,
+    "quoteVerified" BOOLEAN NOT NULL DEFAULT true,
+    "quoteMatchOffset" INTEGER NOT NULL DEFAULT 0,
+    "difficulty" TEXT NOT NULL DEFAULT 'medium',
+    "createdAt" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT "QuizQuestion_topicId_fkey" FOREIGN KEY ("topicId") REFERENCES "Topic" ("id") ON DELETE CASCADE ON UPDATE CASCADE,
+    CONSTRAINT "QuizQuestion_chunkId_fkey" FOREIGN KEY ("chunkId") REFERENCES "DocumentChunk" ("id") ON DELETE SET NULL ON UPDATE CASCADE
+  );`,
+  `CREATE TABLE IF NOT EXISTS "QuizAttempt" (
+    "id" TEXT NOT NULL PRIMARY KEY,
+    "userId" TEXT NOT NULL,
+    "topicId" TEXT NOT NULL,
+    "questionId" TEXT NOT NULL,
+    "selectedAnswerIndex" INTEGER NOT NULL,
+    "isCorrect" BOOLEAN NOT NULL,
+    "oldAlpha" REAL NOT NULL,
+    "oldBeta" REAL NOT NULL,
+    "newAlpha" REAL NOT NULL,
+    "newBeta" REAL NOT NULL,
+    "createdAt" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT "QuizAttempt_userId_fkey" FOREIGN KEY ("userId") REFERENCES "User" ("id") ON DELETE CASCADE ON UPDATE CASCADE,
+    CONSTRAINT "QuizAttempt_topicId_fkey" FOREIGN KEY ("topicId") REFERENCES "Topic" ("id") ON DELETE CASCADE ON UPDATE CASCADE,
+    CONSTRAINT "QuizAttempt_questionId_fkey" FOREIGN KEY ("questionId") REFERENCES "QuizQuestion" ("id") ON DELETE CASCADE ON UPDATE CASCADE
+  );`,
+  `CREATE TABLE IF NOT EXISTS "RevisionItem" (
+    "id" TEXT NOT NULL PRIMARY KEY,
+    "userId" TEXT NOT NULL,
+    "topicId" TEXT NOT NULL,
+    "priorityScore" REAL NOT NULL,
+    "status" TEXT NOT NULL DEFAULT 'todo',
+    "estimatedMinutes" INTEGER NOT NULL DEFAULT 45,
+    "order" INTEGER NOT NULL DEFAULT 0,
+    "updatedAt" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT "RevisionItem_userId_fkey" FOREIGN KEY ("userId") REFERENCES "User" ("id") ON DELETE CASCADE ON UPDATE CASCADE,
+    CONSTRAINT "RevisionItem_topicId_fkey" FOREIGN KEY ("topicId") REFERENCES "Topic" ("id") ON DELETE CASCADE ON UPDATE CASCADE
+  );`,
+];
+
+/**
+ * Creates all SQLite tables programmatically via DDL statements.
  */
 async function ensureSchemaTables(): Promise<void> {
-  const ddlStatements = [
-    `CREATE TABLE IF NOT EXISTS "User" (
-      "id" TEXT NOT NULL PRIMARY KEY,
-      "email" TEXT NOT NULL,
-      "name" TEXT NOT NULL,
-      "password" TEXT NOT NULL DEFAULT 'demo1234',
-      "role" TEXT NOT NULL DEFAULT 'student',
-      "createdAt" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-      "updatedAt" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
-    );`,
-    `CREATE UNIQUE INDEX IF NOT EXISTS "User_email_key" ON "User"("email");`,
-    `CREATE TABLE IF NOT EXISTS "Course" (
-      "id" TEXT NOT NULL PRIMARY KEY,
-      "code" TEXT NOT NULL,
-      "title" TEXT NOT NULL,
-      "description" TEXT NOT NULL,
-      "scope" TEXT NOT NULL DEFAULT 'full',
-      "createdAt" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-      "updatedAt" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
-    );`,
-    `CREATE UNIQUE INDEX IF NOT EXISTS "Course_code_key" ON "Course"("code");`,
-    `CREATE TABLE IF NOT EXISTS "Topic" (
-      "id" TEXT NOT NULL PRIMARY KEY,
-      "courseId" TEXT NOT NULL,
-      "unitName" TEXT NOT NULL,
-      "topicName" TEXT NOT NULL,
-      "subtopicName" TEXT NOT NULL,
-      "syllabusRequired" BOOLEAN NOT NULL DEFAULT true,
-      "inNotes" BOOLEAN NOT NULL DEFAULT true,
-      "examFrequency" INTEGER NOT NULL DEFAULT 1,
-      "examMarksAvg" REAL NOT NULL DEFAULT 10.0,
-      "prerequisiteIds" TEXT NOT NULL DEFAULT '[]',
-      "alpha" REAL NOT NULL DEFAULT 1.0,
-      "beta" REAL NOT NULL DEFAULT 1.0,
-      "estimatedMastery" REAL NOT NULL DEFAULT 0.5,
-      "revisionPriority" REAL NOT NULL DEFAULT 0.5,
-      "createdAt" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-      "updatedAt" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-      FOREIGN KEY ("courseId") REFERENCES "Course" ("id") ON DELETE CASCADE ON UPDATE CASCADE
-    );`,
-    `CREATE TABLE IF NOT EXISTS "Document" (
-      "id" TEXT NOT NULL PRIMARY KEY,
-      "courseId" TEXT NOT NULL,
-      "title" TEXT NOT NULL,
-      "type" TEXT NOT NULL,
-      "fileName" TEXT NOT NULL,
-      "fileSize" INTEGER NOT NULL DEFAULT 0,
-      "uploadedAt" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-      FOREIGN KEY ("courseId") REFERENCES "Course" ("id") ON DELETE CASCADE ON UPDATE CASCADE
-    );`,
-    `CREATE TABLE IF NOT EXISTS "DocumentChunk" (
-      "id" TEXT NOT NULL PRIMARY KEY,
-      "documentId" TEXT NOT NULL,
-      "topicId" TEXT,
-      "section" TEXT NOT NULL,
-      "content" TEXT NOT NULL,
-      "embedding" TEXT,
-      "tokenCount" INTEGER NOT NULL DEFAULT 0,
-      "createdAt" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-      FOREIGN KEY ("documentId") REFERENCES "Document" ("id") ON DELETE CASCADE ON UPDATE CASCADE,
-      FOREIGN KEY ("topicId") REFERENCES "Topic" ("id") ON DELETE SET NULL ON UPDATE CASCADE
-    );`,
-    `CREATE TABLE IF NOT EXISTS "QuizQuestion" (
-      "id" TEXT NOT NULL PRIMARY KEY,
-      "topicId" TEXT NOT NULL,
-      "chunkId" TEXT,
-      "question" TEXT NOT NULL,
-      "options" TEXT NOT NULL,
-      "correctAnswerIndex" INTEGER NOT NULL,
-      "explanation" TEXT NOT NULL,
-      "quoteCitation" TEXT NOT NULL,
-      "quoteVerified" BOOLEAN NOT NULL DEFAULT true,
-      "quoteMatchOffset" INTEGER NOT NULL DEFAULT 0,
-      "difficulty" TEXT NOT NULL DEFAULT 'medium',
-      "createdAt" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-      FOREIGN KEY ("topicId") REFERENCES "Topic" ("id") ON DELETE CASCADE ON UPDATE CASCADE,
-      FOREIGN KEY ("chunkId") REFERENCES "DocumentChunk" ("id") ON DELETE SET NULL ON UPDATE CASCADE
-    );`,
-    `CREATE TABLE IF NOT EXISTS "QuizAttempt" (
-      "id" TEXT NOT NULL PRIMARY KEY,
-      "userId" TEXT NOT NULL,
-      "topicId" TEXT NOT NULL,
-      "questionId" TEXT NOT NULL,
-      "selectedAnswerIndex" INTEGER NOT NULL,
-      "isCorrect" BOOLEAN NOT NULL,
-      "oldAlpha" REAL NOT NULL,
-      "oldBeta" REAL NOT NULL,
-      "newAlpha" REAL NOT NULL,
-      "newBeta" REAL NOT NULL,
-      "createdAt" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-      FOREIGN KEY ("userId") REFERENCES "User" ("id") ON DELETE CASCADE ON UPDATE CASCADE,
-      FOREIGN KEY ("topicId") REFERENCES "Topic" ("id") ON DELETE CASCADE ON UPDATE CASCADE,
-      FOREIGN KEY ("questionId") REFERENCES "QuizQuestion" ("id") ON DELETE CASCADE ON UPDATE CASCADE
-    );`,
-    `CREATE TABLE IF NOT EXISTS "RevisionItem" (
-      "id" TEXT NOT NULL PRIMARY KEY,
-      "userId" TEXT NOT NULL,
-      "topicId" TEXT NOT NULL,
-      "priorityScore" REAL NOT NULL,
-      "status" TEXT NOT NULL DEFAULT 'todo',
-      "estimatedMinutes" INTEGER NOT NULL DEFAULT 45,
-      "order" INTEGER NOT NULL DEFAULT 0,
-      "updatedAt" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-      FOREIGN KEY ("userId") REFERENCES "User" ("id") ON DELETE CASCADE ON UPDATE CASCADE,
-      FOREIGN KEY ("topicId") REFERENCES "Topic" ("id") ON DELETE CASCADE ON UPDATE CASCADE
-    );`,
-  ];
+  // First try running prisma db push if CLI is available in the environment
+  try {
+    if (isVercel) {
+      execSync("npx prisma db push --accept-data-loss --skip-generate", {
+        env: { ...process.env, DATABASE_URL: dbUrl },
+        stdio: "ignore",
+        timeout: 5000,
+      });
+      return;
+    }
+  } catch (err) {
+    // If npx/CLI not available, fallback to programmatic DDL execution
+  }
 
-  for (const sql of ddlStatements) {
+  // Programmatic DDL fallback
+  for (const sql of DDL_STATEMENTS) {
     try {
       await prisma.$executeRawUnsafe(sql);
     } catch (e) {
-      // Table may already exist or handle concurrently
+      // Table may already exist or concurrent execution
     }
   }
+}
+
+// Global promise to prevent concurrent initialization race conditions
+let initializationPromise: Promise<void> | null = null;
+
+/**
+ * Automatically seeds the local SQLite database if empty.
+ */
+export async function ensureDatabaseSeeded(): Promise<void> {
+  if (initializationPromise) return initializationPromise;
+
+  initializationPromise = (async () => {
+    try {
+      // Ensure all tables exist in SQLite
+      await ensureSchemaTables();
+
+      const existingUser = await prisma.user.findUnique({
+        where: { email: "judge.demo@gapfinder.ai" },
+      });
+
+      if (existingUser) {
+        // Ensure all sample questions are populated
+        const qCount = await prisma.quizQuestion.count();
+        if (qCount < DEMO_DATA.sampleQuestions.length) {
+          await prisma.quizQuestion.deleteMany({});
+          for (const q of DEMO_DATA.sampleQuestions) {
+            await prisma.quizQuestion.create({
+              data: {
+                topicId: q.topicId,
+                chunkId: q.chunkId,
+                question: q.question,
+                options: JSON.stringify(q.options),
+                correctAnswerIndex: q.correctAnswerIndex,
+                explanation: q.explanation,
+                quoteCitation: q.quoteCitation,
+                quoteVerified: true,
+                quoteMatchOffset: 0,
+                difficulty: q.difficulty,
+              },
+            });
+          }
+        }
+        return;
+      }
+
+      console.log("⚡ Auto-seeding GapFinder AI database in /tmp/dev.db...");
+
+      // 1. Create Judge Demo User
+      const user = await prisma.user.create({
+        data: {
+          id: "user-judge-demo",
+          email: "judge.demo@gapfinder.ai",
+          name: "Honorable Judge / Evaluator",
+          role: "evaluator",
+        },
+      });
+
+      // 2. Create Course
+      const course = await prisma.course.create({
+        data: {
+          id: DEMO_DATA.course.id,
+          code: DEMO_DATA.course.code,
+          title: DEMO_DATA.course.title,
+          description: DEMO_DATA.course.description,
+          scope: "full",
+        },
+      });
+
+      // 3. Create Documents
+      await prisma.document.create({
+        data: {
+          id: "doc-notes-cs301",
+          courseId: course.id,
+          title: "CS301 Lecture Notes & Architecture Guide",
+          type: "notes",
+          fileName: "CS301_Notes_Distributed_Systems.pdf",
+          fileSize: 412000,
+        },
+      });
+
+      await prisma.document.create({
+        data: {
+          id: "doc-syllabus-cs301",
+          courseId: course.id,
+          title: "Official CS301 Course Syllabus & Learning Outcomes",
+          type: "syllabus",
+          fileName: "CS301_Syllabus_Fall2026.pdf",
+          fileSize: 184000,
+        },
+      });
+
+      await prisma.document.create({
+        data: {
+          id: "doc-pastpaper-cs301",
+          courseId: course.id,
+          title: "CS301 Past Exam Papers (2022-2025 Compilation)",
+          type: "past_paper",
+          fileName: "CS301_Past_Papers_Cumulative.pdf",
+          fileSize: 520000,
+        },
+      });
+
+      // 4. Create Topics (initialized as Unassessed / Pending Diagnostic: alpha=1.0, beta=1.0)
+      for (const t of DEMO_DATA.topics) {
+        await prisma.topic.create({
+          data: {
+            id: t.id,
+            courseId: course.id,
+            unitName: t.unitName,
+            topicName: t.topicName,
+            subtopicName: t.subtopicName,
+            syllabusRequired: t.syllabusRequired,
+            inNotes: t.inNotes,
+            examFrequency: t.examFrequency,
+            examMarksAvg: t.examMarksAvg,
+            prerequisiteIds: JSON.stringify(t.prerequisiteIds),
+            alpha: 1.0,
+            beta: 1.0,
+            estimatedMastery: 0.5,
+            revisionPriority: 0.5,
+          },
+        });
+      }
+
+      // 5. Create Document Chunks
+      for (const chunk of DEMO_DATA.chunks) {
+        await prisma.documentChunk.create({
+          data: {
+            id: chunk.id,
+            documentId: chunk.documentId,
+            topicId: chunk.topicId,
+            section: chunk.section,
+            content: chunk.content,
+            tokenCount: chunk.tokenCount,
+          },
+        });
+      }
+
+      // 6. Create Questions
+      for (const q of DEMO_DATA.sampleQuestions) {
+        await prisma.quizQuestion.create({
+          data: {
+            topicId: q.topicId,
+            chunkId: q.chunkId,
+            question: q.question,
+            options: JSON.stringify(q.options),
+            correctAnswerIndex: q.correctAnswerIndex,
+            explanation: q.explanation,
+            quoteCitation: q.quoteCitation,
+            quoteVerified: true,
+            quoteMatchOffset: 0,
+            difficulty: q.difficulty,
+          },
+        });
+      }
+
+      // 7. Calculate and insert baseline revision schedule
+      const schedule = calculateDeterministicRevisionSchedule(DEMO_DATA.topics, "full");
+      for (let i = 0; i < schedule.length; i++) {
+        const item = schedule[i];
+        await prisma.revisionItem.create({
+          data: {
+            userId: user.id,
+            topicId: item.topicId,
+            priorityScore: item.priorityScore,
+            status: "todo",
+            estimatedMinutes: item.recommendedMinutes,
+            order: item.rank,
+          },
+        });
+      }
+
+      console.log("✅ Auto-seeding completed with baseline unassessed state in /tmp/dev.db!");
+    } catch (error) {
+      console.error("Error during auto-seeding:", error);
+    }
+  })();
+
+  return initializationPromise;
 }
 
 /**
@@ -292,175 +463,5 @@ export async function resetDemoCourseState(userId: string = "user-judge-demo"): 
     }
   } catch (err) {
     console.error("Error resetting demo course state:", err);
-  }
-}
-
-/**
- * Automatically seeds the local SQLite database if empty.
- */
-export async function ensureDatabaseSeeded(): Promise<void> {
-  try {
-    // If running on Vercel or fresh instance, ensure DDL tables exist first
-    await ensureSchemaTables();
-
-    const existingUser = await prisma.user.findUnique({
-      where: { email: "judge.demo@gapfinder.ai" },
-    });
-
-    if (existingUser) {
-      // Ensure all sample questions are populated
-      const qCount = await prisma.quizQuestion.count();
-      if (qCount < DEMO_DATA.sampleQuestions.length) {
-        await prisma.quizQuestion.deleteMany({});
-        for (const q of DEMO_DATA.sampleQuestions) {
-          await prisma.quizQuestion.create({
-            data: {
-              topicId: q.topicId,
-              chunkId: q.chunkId,
-              question: q.question,
-              options: JSON.stringify(q.options),
-              correctAnswerIndex: q.correctAnswerIndex,
-              explanation: q.explanation,
-              quoteCitation: q.quoteCitation,
-              quoteVerified: true,
-              quoteMatchOffset: 0,
-              difficulty: q.difficulty,
-            },
-          });
-        }
-      }
-      return;
-    }
-
-    console.log("⚡ Auto-seeding GapFinder AI local SQLite database...");
-
-    // 1. Create Judge Demo User
-    const user = await prisma.user.create({
-      data: {
-        id: "user-judge-demo",
-        email: "judge.demo@gapfinder.ai",
-        name: "Honorable Judge / Evaluator",
-        role: "evaluator",
-      },
-    });
-
-    // 2. Create Course
-    const course = await prisma.course.create({
-      data: {
-        id: DEMO_DATA.course.id,
-        code: DEMO_DATA.course.code,
-        title: DEMO_DATA.course.title,
-        description: DEMO_DATA.course.description,
-        scope: "full",
-      },
-    });
-
-    // 3. Create Documents
-    await prisma.document.create({
-      data: {
-        id: "doc-notes-cs301",
-        courseId: course.id,
-        title: "CS301 Lecture Notes & Architecture Guide",
-        type: "notes",
-        fileName: "CS301_Notes_Distributed_Systems.pdf",
-        fileSize: 412000,
-      },
-    });
-
-    await prisma.document.create({
-      data: {
-        id: "doc-syllabus-cs301",
-        courseId: course.id,
-        title: "Official CS301 Course Syllabus & Learning Outcomes",
-        type: "syllabus",
-        fileName: "CS301_Syllabus_Fall2026.pdf",
-        fileSize: 184000,
-      },
-    });
-
-    await prisma.document.create({
-      data: {
-        id: "doc-pastpaper-cs301",
-        courseId: course.id,
-        title: "CS301 Past Exam Papers (2022-2025 Compilation)",
-        type: "past_paper",
-        fileName: "CS301_Past_Papers_Cumulative.pdf",
-        fileSize: 520000,
-      },
-    });
-
-    // 4. Create Topics (initialized as Unassessed / Pending Diagnostic: alpha=1.0, beta=1.0)
-    for (const t of DEMO_DATA.topics) {
-      await prisma.topic.create({
-        data: {
-          id: t.id,
-          courseId: course.id,
-          unitName: t.unitName,
-          topicName: t.topicName,
-          subtopicName: t.subtopicName,
-          syllabusRequired: t.syllabusRequired,
-          inNotes: t.inNotes,
-          examFrequency: t.examFrequency,
-          examMarksAvg: t.examMarksAvg,
-          prerequisiteIds: JSON.stringify(t.prerequisiteIds),
-          alpha: 1.0,
-          beta: 1.0,
-          estimatedMastery: 0.5,
-          revisionPriority: 0.5,
-        },
-      });
-    }
-
-    // 5. Create Document Chunks
-    for (const chunk of DEMO_DATA.chunks) {
-      await prisma.documentChunk.create({
-        data: {
-          id: chunk.id,
-          documentId: chunk.documentId,
-          topicId: chunk.topicId,
-          section: chunk.section,
-          content: chunk.content,
-          tokenCount: chunk.tokenCount,
-        },
-      });
-    }
-
-    // 6. Create Questions
-    for (const q of DEMO_DATA.sampleQuestions) {
-      await prisma.quizQuestion.create({
-        data: {
-          topicId: q.topicId,
-          chunkId: q.chunkId,
-          question: q.question,
-          options: JSON.stringify(q.options),
-          correctAnswerIndex: q.correctAnswerIndex,
-          explanation: q.explanation,
-          quoteCitation: q.quoteCitation,
-          quoteVerified: true,
-          quoteMatchOffset: 0,
-          difficulty: q.difficulty,
-        },
-      });
-    }
-
-    // 7. Calculate and insert baseline revision schedule
-    const schedule = calculateDeterministicRevisionSchedule(DEMO_DATA.topics, "full");
-    for (let i = 0; i < schedule.length; i++) {
-      const item = schedule[i];
-      await prisma.revisionItem.create({
-        data: {
-          userId: user.id,
-          topicId: item.topicId,
-          priorityScore: item.priorityScore,
-          status: "todo",
-          estimatedMinutes: item.recommendedMinutes,
-          order: item.rank,
-        },
-      });
-    }
-
-    console.log("✅ Auto-seeding completed with baseline unassessed state!");
-  } catch (error) {
-    console.error("Error during auto-seeding:", error);
   }
 }
