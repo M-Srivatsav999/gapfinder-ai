@@ -1,7 +1,6 @@
 import { PrismaClient } from "@prisma/client";
 import fs from "fs";
 import path from "path";
-import { execSync } from "child_process";
 import { DEMO_DATA } from "./seed-data";
 import { calculateDeterministicRevisionSchedule } from "./revision-formula";
 
@@ -44,25 +43,20 @@ const { dbPath, dbUrl } = getDatabaseConfig();
 process.env.DATABASE_URL = dbUrl;
 
 /**
- * Initializes the SQLite database file on disk.
- * If running on Vercel: creates /tmp/dev.db immediately if missing or 0 bytes.
- * Does NOT attempt to copy missing files.
+ * Prepares the directory without creating invalid 0-byte files.
  */
 function prepareDatabaseFile(): void {
   try {
-    if (isVercel) {
-      if (!fs.existsSync(dbPath) || fs.statSync(dbPath).size === 0) {
-        console.log(`[Vercel Serverless] Creating fresh writable SQLite database at ${dbPath}...`);
-        fs.mkdirSync(path.dirname(dbPath), { recursive: true });
-        fs.writeFileSync(dbPath, "");
-      }
-    } else {
-      if (!fs.existsSync(dbPath)) {
-        fs.mkdirSync(path.dirname(dbPath), { recursive: true });
-      }
+    const dir = path.dirname(dbPath);
+    if (!fs.existsSync(dir)) {
+      fs.mkdirSync(dir, { recursive: true });
+    }
+    // If a 0-byte or invalid file exists, remove it so SQLite can recreate it cleanly
+    if (fs.existsSync(dbPath) && fs.statSync(dbPath).size === 0) {
+      fs.unlinkSync(dbPath);
     }
   } catch (err) {
-    console.error("Error creating database file on disk:", err);
+    console.error("Error preparing database directory:", err);
   }
 }
 
@@ -198,26 +192,11 @@ const DDL_STATEMENTS = [
  * Creates all SQLite tables programmatically via DDL statements.
  */
 async function ensureSchemaTables(): Promise<void> {
-  // First try running prisma db push if CLI is available in the environment
-  try {
-    if (isVercel) {
-      execSync("npx prisma db push --accept-data-loss --skip-generate", {
-        env: { ...process.env, DATABASE_URL: dbUrl },
-        stdio: "ignore",
-        timeout: 5000,
-      });
-      return;
-    }
-  } catch (err) {
-    // If npx/CLI not available, fallback to programmatic DDL execution
-  }
-
-  // Programmatic DDL fallback
   for (const sql of DDL_STATEMENTS) {
     try {
       await prisma.$executeRawUnsafe(sql);
     } catch (e) {
-      // Table may already exist or concurrent execution
+      // Ignore if table/index already exists
     }
   }
 }
@@ -226,7 +205,7 @@ async function ensureSchemaTables(): Promise<void> {
 let initializationPromise: Promise<void> | null = null;
 
 /**
- * Automatically seeds the local SQLite database if empty.
+ * Automatically seeds the SQLite database if empty.
  */
 export async function ensureDatabaseSeeded(): Promise<void> {
   if (initializationPromise) return initializationPromise;
@@ -265,7 +244,7 @@ export async function ensureDatabaseSeeded(): Promise<void> {
         return;
       }
 
-      console.log("⚡ Auto-seeding GapFinder AI database in /tmp/dev.db...");
+      console.log("⚡ Auto-seeding GapFinder AI database...");
 
       // 1. Create Judge Demo User
       const user = await prisma.user.create({
@@ -322,7 +301,7 @@ export async function ensureDatabaseSeeded(): Promise<void> {
         },
       });
 
-      // 4. Create Topics (initialized as Unassessed / Pending Diagnostic: alpha=1.0, beta=1.0)
+      // 4. Create Topics
       for (const t of DEMO_DATA.topics) {
         await prisma.topic.create({
           data: {
@@ -392,7 +371,7 @@ export async function ensureDatabaseSeeded(): Promise<void> {
         });
       }
 
-      console.log("✅ Auto-seeding completed with baseline unassessed state in /tmp/dev.db!");
+      console.log("✅ Auto-seeding completed successfully!");
     } catch (error) {
       console.error("Error during auto-seeding:", error);
     }
@@ -402,19 +381,16 @@ export async function ensureDatabaseSeeded(): Promise<void> {
 }
 
 /**
- * Resets the demo course state to baseline unassessed state
- * for the 1-Click Judge Demo evaluation.
+ * Resets the demo course state to baseline unassessed state.
  */
 export async function resetDemoCourseState(userId: string = "user-judge-demo"): Promise<void> {
   try {
     await ensureDatabaseSeeded();
 
-    // 1. Delete previous attempts for demo user
     await prisma.quizAttempt.deleteMany({
       where: { userId },
     });
 
-    // 2. Reset topics to baseline unassessed parameters (alpha=1.0, beta=1.0, mastery=0.5)
     for (const t of DEMO_DATA.topics) {
       const existing = await prisma.topic.findUnique({ where: { id: t.id } });
       if (existing) {
@@ -431,7 +407,6 @@ export async function resetDemoCourseState(userId: string = "user-judge-demo"): 
       }
     }
 
-    // 3. Recalculate baseline reading plan items
     const schedule = calculateDeterministicRevisionSchedule(DEMO_DATA.topics, "full");
     for (const item of schedule) {
       const existingRev = await prisma.revisionItem.findFirst({
