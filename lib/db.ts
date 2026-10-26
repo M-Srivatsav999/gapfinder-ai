@@ -16,24 +16,27 @@ const globalForPrisma = globalThis as unknown as {
 const isVercel =
   process.env.VERCEL === "1" ||
   Boolean(process.env.VERCEL) ||
-  Boolean(process.env.AWS_LAMBDA_FUNCTION_NAME);
+  Boolean(process.env.VERCEL_ENV) ||
+  Boolean(process.env.AWS_LAMBDA_FUNCTION_NAME) ||
+  Boolean(process.env.LAMBDA_TASK_ROOT);
 
 /**
  * Resolves the appropriate writable SQLite file path and connection URL.
- * - On Vercel (Linux Serverless): strictly "file:///tmp/dev.db" (three-slash absolute path).
- * - On Local Development: "prisma/dev.db".
+ * - On Vercel (Linux Serverless): writable storage is strictly /tmp/dev.db.
+ *   The standard SQLite file URL format is "file:/tmp/dev.db".
+ * - On Local Development: resolves to the absolute path of prisma/dev.db.
  */
 function getDatabaseConfig(): { dbPath: string; dbUrl: string } {
   if (isVercel) {
     const dbPath = "/tmp/dev.db";
     return {
       dbPath,
-      dbUrl: "file:///tmp/dev.db",
+      dbUrl: "file:/tmp/dev.db",
     };
   }
 
   const localPath = path.join(process.cwd(), "prisma", "dev.db");
-  const localUrl = process.env.DATABASE_URL || `file:${localPath.replace(/\\/g, "/")}`;
+  const localUrl = `file:${localPath.replace(/\\/g, "/")}`;
   return {
     dbPath: localPath,
     dbUrl: localUrl,
@@ -46,8 +49,8 @@ const { dbPath, dbUrl } = getDatabaseConfig();
 process.env.DATABASE_URL = dbUrl;
 
 /**
- * Prepares the SQLite database directory and touches the file if needed.
- * Safe for serverless cold starts.
+ * Prepares the SQLite database directory and bootstraps the file if needed.
+ * On Vercel: copies the bundled pre-seeded database to /tmp/dev.db on cold start.
  */
 function prepareDatabaseFile(): void {
   try {
@@ -55,8 +58,37 @@ function prepareDatabaseFile(): void {
     if (!fs.existsSync(dir)) {
       fs.mkdirSync(dir, { recursive: true });
     }
-    if (isVercel && !fs.existsSync(dbPath)) {
-      fs.writeFileSync(dbPath, "");
+
+    if (isVercel) {
+      // If /tmp/dev.db does not exist or is 0 bytes, copy from bundled template
+      if (!fs.existsSync(dbPath) || fs.statSync(dbPath).size === 0) {
+        const candidateSources = [
+          path.join(process.cwd(), "prisma", "dev.db"),
+          path.join(process.cwd(), "dev.db"),
+          path.join(__dirname, "..", "prisma", "dev.db"),
+          path.join(__dirname, "..", "..", "prisma", "dev.db"),
+          path.join("/var/task", "prisma", "dev.db"),
+        ];
+
+        let copied = false;
+        for (const source of candidateSources) {
+          try {
+            if (fs.existsSync(source) && fs.statSync(source).size > 0) {
+              fs.copyFileSync(source, dbPath);
+              console.log(`[Vercel Serverless] Successfully copied bundled database from ${source} to ${dbPath}`);
+              copied = true;
+              break;
+            }
+          } catch (copyErr) {
+            console.warn(`[Vercel Serverless] Copy attempt failed from ${source}:`, copyErr);
+          }
+        }
+
+        if (!copied && !fs.existsSync(dbPath)) {
+          console.log(`[Vercel Serverless] Initializing fresh database at ${dbPath}...`);
+          fs.writeFileSync(dbPath, "");
+        }
+      }
     }
   } catch (err) {
     console.error("Error preparing SQLite database file on disk:", err);
