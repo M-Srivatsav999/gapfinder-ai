@@ -1,6 +1,7 @@
 import { PrismaClient } from "@prisma/client";
 import fs from "fs";
 import path from "path";
+import { execSync } from "child_process";
 import { DEMO_DATA } from "./seed-data";
 import { calculateDeterministicRevisionSchedule } from "./revision-formula";
 
@@ -43,7 +44,8 @@ const { dbPath, dbUrl } = getDatabaseConfig();
 process.env.DATABASE_URL = dbUrl;
 
 /**
- * Prepares the directory without creating invalid 0-byte files.
+ * Initializes the SQLite database file on disk.
+ * If running on Vercel: prepares /tmp directory safely.
  */
 function prepareDatabaseFile(): void {
   try {
@@ -72,7 +74,7 @@ export const prisma =
 if (process.env.NODE_ENV !== "production") globalForPrisma.prisma = prisma;
 
 /**
- * Programmatic DDL statements to create all tables inside /tmp/dev.db
+ * Programmatic DDL statements to create all tables inside the database
  */
 const DDL_STATEMENTS = [
   `PRAGMA journal_mode = WAL;`,
@@ -188,11 +190,24 @@ const DDL_STATEMENTS = [
  * Creates all SQLite tables programmatically via DDL statements.
  */
 async function ensureSchemaTables(): Promise<void> {
+  try {
+    if (isVercel) {
+      execSync("npx prisma db push --accept-data-loss --skip-generate", {
+        env: { ...process.env, DATABASE_URL: dbUrl },
+        stdio: "ignore",
+        timeout: 5000,
+      });
+      return;
+    }
+  } catch (err) {
+    // Fallback to programmatic DDL if CLI is unavailable
+  }
+
   for (const sql of DDL_STATEMENTS) {
     try {
       await prisma.$executeRawUnsafe(sql);
     } catch (e) {
-      // Ignore if table/index already exists
+      // Table may already exist
     }
   }
 }
@@ -208,7 +223,6 @@ export async function ensureDatabaseSeeded(): Promise<void> {
 
   initializationPromise = (async () => {
     try {
-      // Ensure all tables exist in SQLite
       await ensureSchemaTables();
 
       const existingUser = await prisma.user.findUnique({
@@ -216,7 +230,6 @@ export async function ensureDatabaseSeeded(): Promise<void> {
       });
 
       if (existingUser) {
-        // Ensure all sample questions are populated
         const qCount = await prisma.quizQuestion.count();
         if (qCount < DEMO_DATA.sampleQuestions.length) {
           await prisma.quizQuestion.deleteMany({});
