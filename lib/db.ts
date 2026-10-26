@@ -1,18 +1,234 @@
 import { PrismaClient } from "@prisma/client";
+import fs from "fs";
+import path from "path";
+import os from "os";
 import { DEMO_DATA } from "./seed-data";
 import { calculateDeterministicRevisionSchedule } from "./revision-formula";
 
 const globalForPrisma = globalThis as unknown as {
   prisma: PrismaClient | undefined;
+  dbInitialized: boolean | undefined;
 };
+
+const isVercel =
+  process.env.VERCEL === "1" ||
+  Boolean(process.env.VERCEL) ||
+  Boolean(process.env.AWS_LAMBDA_FUNCTION_NAME);
+
+/**
+ * Resolves the appropriate writable SQLite file path and connection URL.
+ * On Vercel / serverless: uses /tmp/dev.db (the only writable directory).
+ * On local: uses prisma/dev.db.
+ */
+function getDatabaseConfig(): { dbPath: string; dbUrl: string } {
+  if (isVercel) {
+    const tmpDir = process.platform === "win32" ? os.tmpdir() : "/tmp";
+    const dbPath = path.join(tmpDir, "dev.db");
+    return {
+      dbPath,
+      dbUrl: `file:${dbPath.replace(/\\/g, "/")}`,
+    };
+  }
+
+  // Local development
+  const localPath = path.join(process.cwd(), "prisma", "dev.db");
+  return {
+    dbPath: localPath,
+    dbUrl: process.env.DATABASE_URL || `file:${localPath.replace(/\\/g, "/")}`,
+  };
+}
+
+const { dbPath, dbUrl } = getDatabaseConfig();
+
+// Ensure process.env.DATABASE_URL matches the resolved URL
+process.env.DATABASE_URL = dbUrl;
+
+/**
+ * Initializes the SQLite database file on disk.
+ * If running on Vercel and /tmp/dev.db does not exist, copies from project source
+ * or prepares for DDL table creation.
+ */
+function prepareDatabaseFile(): void {
+  try {
+    if (isVercel) {
+      if (!fs.existsSync(dbPath)) {
+        console.log(`[Vercel Serverless] Initializing writable SQLite database at ${dbPath}...`);
+
+        // Check potential locations for bundled template database
+        const candidateSources = [
+          path.join(process.cwd(), "prisma", "dev.db"),
+          path.join(process.cwd(), "dev.db"),
+          path.join(__dirname, "..", "prisma", "dev.db"),
+          path.join(__dirname, "..", "..", "prisma", "dev.db"),
+        ];
+
+        let copied = false;
+        for (const source of candidateSources) {
+          if (fs.existsSync(source) && fs.statSync(source).size > 0) {
+            try {
+              fs.mkdirSync(path.dirname(dbPath), { recursive: true });
+              fs.copyFileSync(source, dbPath);
+              console.log(`[Vercel Serverless] Successfully copied database from ${source} to ${dbPath}`);
+              copied = true;
+              break;
+            } catch (copyErr) {
+              console.warn(`[Vercel Serverless] Copy attempt failed from ${source}:`, copyErr);
+            }
+          }
+        }
+
+        if (!copied) {
+          console.log(`[Vercel Serverless] No pre-existing database found. Creating empty file at ${dbPath}...`);
+          fs.mkdirSync(path.dirname(dbPath), { recursive: true });
+          fs.writeFileSync(dbPath, "");
+        }
+      }
+    } else {
+      // Local development check
+      if (!fs.existsSync(dbPath)) {
+        fs.mkdirSync(path.dirname(dbPath), { recursive: true });
+      }
+    }
+  } catch (err) {
+    console.error("Error preparing database file on disk:", err);
+  }
+}
+
+prepareDatabaseFile();
 
 export const prisma =
   globalForPrisma.prisma ??
   new PrismaClient({
+    datasources: {
+      db: {
+        url: dbUrl,
+      },
+    },
     log: process.env.NODE_ENV === "development" ? ["error", "warn"] : ["error"],
   });
 
 if (process.env.NODE_ENV !== "production") globalForPrisma.prisma = prisma;
+
+/**
+ * Executes DDL statements to ensure all SQLite tables exist if running on a fresh /tmp/dev.db
+ */
+async function ensureSchemaTables(): Promise<void> {
+  const ddlStatements = [
+    `CREATE TABLE IF NOT EXISTS "User" (
+      "id" TEXT NOT NULL PRIMARY KEY,
+      "email" TEXT NOT NULL,
+      "name" TEXT NOT NULL,
+      "password" TEXT NOT NULL DEFAULT 'demo1234',
+      "role" TEXT NOT NULL DEFAULT 'student',
+      "createdAt" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      "updatedAt" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );`,
+    `CREATE UNIQUE INDEX IF NOT EXISTS "User_email_key" ON "User"("email");`,
+    `CREATE TABLE IF NOT EXISTS "Course" (
+      "id" TEXT NOT NULL PRIMARY KEY,
+      "code" TEXT NOT NULL,
+      "title" TEXT NOT NULL,
+      "description" TEXT NOT NULL,
+      "scope" TEXT NOT NULL DEFAULT 'full',
+      "createdAt" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      "updatedAt" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );`,
+    `CREATE UNIQUE INDEX IF NOT EXISTS "Course_code_key" ON "Course"("code");`,
+    `CREATE TABLE IF NOT EXISTS "Topic" (
+      "id" TEXT NOT NULL PRIMARY KEY,
+      "courseId" TEXT NOT NULL,
+      "unitName" TEXT NOT NULL,
+      "topicName" TEXT NOT NULL,
+      "subtopicName" TEXT NOT NULL,
+      "syllabusRequired" BOOLEAN NOT NULL DEFAULT true,
+      "inNotes" BOOLEAN NOT NULL DEFAULT true,
+      "examFrequency" INTEGER NOT NULL DEFAULT 1,
+      "examMarksAvg" REAL NOT NULL DEFAULT 10.0,
+      "prerequisiteIds" TEXT NOT NULL DEFAULT '[]',
+      "alpha" REAL NOT NULL DEFAULT 1.0,
+      "beta" REAL NOT NULL DEFAULT 1.0,
+      "estimatedMastery" REAL NOT NULL DEFAULT 0.5,
+      "revisionPriority" REAL NOT NULL DEFAULT 0.5,
+      "createdAt" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      "updatedAt" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY ("courseId") REFERENCES "Course" ("id") ON DELETE CASCADE ON UPDATE CASCADE
+    );`,
+    `CREATE TABLE IF NOT EXISTS "Document" (
+      "id" TEXT NOT NULL PRIMARY KEY,
+      "courseId" TEXT NOT NULL,
+      "title" TEXT NOT NULL,
+      "type" TEXT NOT NULL,
+      "fileName" TEXT NOT NULL,
+      "fileSize" INTEGER NOT NULL DEFAULT 0,
+      "uploadedAt" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY ("courseId") REFERENCES "Course" ("id") ON DELETE CASCADE ON UPDATE CASCADE
+    );`,
+    `CREATE TABLE IF NOT EXISTS "DocumentChunk" (
+      "id" TEXT NOT NULL PRIMARY KEY,
+      "documentId" TEXT NOT NULL,
+      "topicId" TEXT,
+      "section" TEXT NOT NULL,
+      "content" TEXT NOT NULL,
+      "embedding" TEXT,
+      "tokenCount" INTEGER NOT NULL DEFAULT 0,
+      "createdAt" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY ("documentId") REFERENCES "Document" ("id") ON DELETE CASCADE ON UPDATE CASCADE,
+      FOREIGN KEY ("topicId") REFERENCES "Topic" ("id") ON DELETE SET NULL ON UPDATE CASCADE
+    );`,
+    `CREATE TABLE IF NOT EXISTS "QuizQuestion" (
+      "id" TEXT NOT NULL PRIMARY KEY,
+      "topicId" TEXT NOT NULL,
+      "chunkId" TEXT,
+      "question" TEXT NOT NULL,
+      "options" TEXT NOT NULL,
+      "correctAnswerIndex" INTEGER NOT NULL,
+      "explanation" TEXT NOT NULL,
+      "quoteCitation" TEXT NOT NULL,
+      "quoteVerified" BOOLEAN NOT NULL DEFAULT true,
+      "quoteMatchOffset" INTEGER NOT NULL DEFAULT 0,
+      "difficulty" TEXT NOT NULL DEFAULT 'medium',
+      "createdAt" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY ("topicId") REFERENCES "Topic" ("id") ON DELETE CASCADE ON UPDATE CASCADE,
+      FOREIGN KEY ("chunkId") REFERENCES "DocumentChunk" ("id") ON DELETE SET NULL ON UPDATE CASCADE
+    );`,
+    `CREATE TABLE IF NOT EXISTS "QuizAttempt" (
+      "id" TEXT NOT NULL PRIMARY KEY,
+      "userId" TEXT NOT NULL,
+      "topicId" TEXT NOT NULL,
+      "questionId" TEXT NOT NULL,
+      "selectedAnswerIndex" INTEGER NOT NULL,
+      "isCorrect" BOOLEAN NOT NULL,
+      "oldAlpha" REAL NOT NULL,
+      "oldBeta" REAL NOT NULL,
+      "newAlpha" REAL NOT NULL,
+      "newBeta" REAL NOT NULL,
+      "createdAt" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY ("userId") REFERENCES "User" ("id") ON DELETE CASCADE ON UPDATE CASCADE,
+      FOREIGN KEY ("topicId") REFERENCES "Topic" ("id") ON DELETE CASCADE ON UPDATE CASCADE,
+      FOREIGN KEY ("questionId") REFERENCES "QuizQuestion" ("id") ON DELETE CASCADE ON UPDATE CASCADE
+    );`,
+    `CREATE TABLE IF NOT EXISTS "RevisionItem" (
+      "id" TEXT NOT NULL PRIMARY KEY,
+      "userId" TEXT NOT NULL,
+      "topicId" TEXT NOT NULL,
+      "priorityScore" REAL NOT NULL,
+      "status" TEXT NOT NULL DEFAULT 'todo',
+      "estimatedMinutes" INTEGER NOT NULL DEFAULT 45,
+      "order" INTEGER NOT NULL DEFAULT 0,
+      "updatedAt" DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY ("userId") REFERENCES "User" ("id") ON DELETE CASCADE ON UPDATE CASCADE,
+      FOREIGN KEY ("topicId") REFERENCES "Topic" ("id") ON DELETE CASCADE ON UPDATE CASCADE
+    );`,
+  ];
+
+  for (const sql of ddlStatements) {
+    try {
+      await prisma.$executeRawUnsafe(sql);
+    } catch (e) {
+      // Table may already exist or handle concurrently
+    }
+  }
+}
 
 /**
  * Resets the demo course state to baseline unassessed state
@@ -20,6 +236,8 @@ if (process.env.NODE_ENV !== "production") globalForPrisma.prisma = prisma;
  */
 export async function resetDemoCourseState(userId: string = "user-judge-demo"): Promise<void> {
   try {
+    await ensureDatabaseSeeded();
+
     // 1. Delete previous attempts for demo user
     await prisma.quizAttempt.deleteMany({
       where: { userId },
@@ -72,28 +290,6 @@ export async function resetDemoCourseState(userId: string = "user-judge-demo"): 
         });
       }
     }
-
-    // 4. Ensure all sample questions are populated in SQLite
-    const questionCount = await prisma.quizQuestion.count();
-    if (questionCount < DEMO_DATA.sampleQuestions.length) {
-      await prisma.quizQuestion.deleteMany({});
-      for (const q of DEMO_DATA.sampleQuestions) {
-        await prisma.quizQuestion.create({
-          data: {
-            topicId: q.topicId,
-            chunkId: q.chunkId,
-            question: q.question,
-            options: JSON.stringify(q.options),
-            correctAnswerIndex: q.correctAnswerIndex,
-            explanation: q.explanation,
-            quoteCitation: q.quoteCitation,
-            quoteVerified: true,
-            quoteMatchOffset: 0,
-            difficulty: q.difficulty,
-          },
-        });
-      }
-    }
   } catch (err) {
     console.error("Error resetting demo course state:", err);
   }
@@ -104,12 +300,15 @@ export async function resetDemoCourseState(userId: string = "user-judge-demo"): 
  */
 export async function ensureDatabaseSeeded(): Promise<void> {
   try {
+    // If running on Vercel or fresh instance, ensure DDL tables exist first
+    await ensureSchemaTables();
+
     const existingUser = await prisma.user.findUnique({
       where: { email: "judge.demo@gapfinder.ai" },
     });
 
     if (existingUser) {
-      // If questions are missing or incomplete, ensure they are seeded
+      // Ensure all sample questions are populated
       const qCount = await prisma.quizQuestion.count();
       if (qCount < DEMO_DATA.sampleQuestions.length) {
         await prisma.quizQuestion.deleteMany({});
