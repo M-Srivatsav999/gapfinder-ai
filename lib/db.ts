@@ -189,20 +189,19 @@ const DDL_STATEMENTS = [
 /**
  * Creates all SQLite tables programmatically via DDL statements.
  */
+/**
+ * Creates all SQLite tables programmatically via DDL statements.
+ * Completely avoids npx/CLI execution which fails in serverless environments.
+ */
 async function ensureSchemaTables(): Promise<void> {
-  try {
-    if (isVercel) {
-      execSync("npx prisma db push --accept-data-loss --skip-generate", {
-        env: { ...process.env, DATABASE_URL: dbUrl },
-        stdio: "ignore",
-        timeout: 5000,
-      });
-      return;
+  for (const sql of DDL_STATEMENTS) {
+    try {
+      await prisma.$executeRawUnsafe(sql);
+    } catch (e) {
+      // Table or index may already exist, safe to ignore
     }
-  } catch (err) {
-    // Fallback to programmatic DDL if CLI is unavailable
   }
-
+}
   for (const sql of DDL_STATEMENTS) {
     try {
       await prisma.$executeRawUnsafe(sql);
