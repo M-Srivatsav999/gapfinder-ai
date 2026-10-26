@@ -16,7 +16,7 @@ const isVercel =
 
 /**
  * Resolves the appropriate writable SQLite file path and connection URL.
- * On Vercel: strictly file:/tmp/dev.db (the only writable directory).
+ * On Vercel: strictly file:///tmp/dev.db (using 3 slashes for Linux absolute paths).
  * On Local: prisma/dev.db.
  */
 function getDatabaseConfig(): { dbPath: string; dbUrl: string } {
@@ -24,7 +24,7 @@ function getDatabaseConfig(): { dbPath: string; dbUrl: string } {
     const dbPath = "/tmp/dev.db";
     return {
       dbPath,
-      dbUrl: "file:/tmp/dev.db",
+      dbUrl: "file:///tmp/dev.db",
     };
   }
 
@@ -50,10 +50,6 @@ function prepareDatabaseFile(): void {
     const dir = path.dirname(dbPath);
     if (!fs.existsSync(dir)) {
       fs.mkdirSync(dir, { recursive: true });
-    }
-    // If a 0-byte or invalid file exists, remove it so SQLite can recreate it cleanly
-    if (fs.existsSync(dbPath) && fs.statSync(dbPath).size === 0) {
-      fs.unlinkSync(dbPath);
     }
   } catch (err) {
     console.error("Error preparing database directory:", err);
