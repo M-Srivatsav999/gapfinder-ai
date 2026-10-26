@@ -1,0 +1,130 @@
+datasource db {
+  provider = "sqlite"
+  url      = "file:./dev.db"
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+model User {
+  id        String   @id @default(cuid())
+  email     String   @unique
+  name      String
+  password  String   @default("demo1234")
+  role      String   @default("student")
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  attempts  QuizAttempt[]
+  revisions RevisionItem[]
+}
+
+model Course {
+  id          String   @id @default(cuid())
+  code        String   @unique
+  title       String
+  description String
+  scope       String   @default("full") // notes_only | notes_syllabus | full
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+  topics      Topic[]
+  documents   Document[]
+}
+
+model Topic {
+  id               String   @id @default(cuid())
+  courseId         String
+  course           Course   @relation(fields: [courseId], references: [id], onDelete: Cascade)
+  unitName         String
+  topicName        String
+  subtopicName     String
+  syllabusRequired Boolean  @default(true)
+  inNotes          Boolean  @default(true)
+  examFrequency    Int      @default(1)
+  examMarksAvg     Float    @default(10.0)
+  prerequisiteIds  String   @default("[]") // JSON string array of Topic IDs
+  alpha            Float    @default(1.0)
+  beta             Float    @default(1.0)
+  estimatedMastery Float    @default(0.5)
+  revisionPriority Float    @default(0.5)
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+  chunks           DocumentChunk[]
+  questions        QuizQuestion[]
+  attempts         QuizAttempt[]
+  revisions        RevisionItem[]
+}
+
+model Document {
+  id         String   @id @default(cuid())
+  courseId   String
+  course     Course   @relation(fields: [courseId], references: [id], onDelete: Cascade)
+  title      String
+  type       String   // notes | syllabus | past_paper
+  fileName   String
+  fileSize   Int      @default(0)
+  uploadedAt DateTime @default(now())
+  chunks     DocumentChunk[]
+}
+
+model DocumentChunk {
+  id        String   @id @default(cuid())
+  documentId String
+  document   Document @relation(fields: [documentId], references: [id], onDelete: Cascade)
+  topicId    String?
+  topic      Topic?   @relation(fields: [topicId], references: [id], onDelete: SetNull)
+  section    String
+  content    String
+  embedding  String?  // JSON serialized vector of numbers
+  tokenCount Int      @default(0)
+  createdAt  DateTime @default(now())
+  questions  QuizQuestion[]
+}
+
+model QuizQuestion {
+  id                 String   @id @default(cuid())
+  topicId            String
+  topic              Topic    @relation(fields: [topicId], references: [id], onDelete: Cascade)
+  chunkId            String?
+  chunk              DocumentChunk? @relation(fields: [chunkId], references: [id], onDelete: SetNull)
+  question           String
+  options            String   // JSON string array of 4 options
+  correctAnswerIndex Int
+  explanation        String
+  quoteCitation      String   // verbatim quoted text from source chunk
+  quoteVerified      Boolean  @default(true) // verified by deterministic quote gate
+  quoteMatchOffset   Int      @default(0)
+  difficulty         String   @default("medium") // easy | medium | hard
+  createdAt          DateTime @default(now())
+  attempts           QuizAttempt[]
+}
+
+model QuizAttempt {
+  id                  String   @id @default(cuid())
+  userId              String
+  user                User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  topicId             String
+  topic               Topic    @relation(fields: [topicId], references: [id], onDelete: Cascade)
+  questionId          String
+  question            QuizQuestion @relation(fields: [questionId], references: [id], onDelete: Cascade)
+  selectedAnswerIndex Int
+  isCorrect           Boolean
+  oldAlpha            Float
+  oldBeta             Float
+  newAlpha            Float
+  newBeta             Float
+  createdAt           DateTime @default(now())
+}
+
+model RevisionItem {
+  id               String   @id @default(cuid())
+  userId           String
+  user             User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  topicId          String
+  topic            Topic    @relation(fields: [topicId], references: [id], onDelete: Cascade)
+  priorityScore    Float
+  status           String   @default("todo") // todo | in_progress | mastered
+  estimatedMinutes Int      @default(45)
+  order            Int      @default(0)
+  updatedAt        DateTime @updatedAt
+}
